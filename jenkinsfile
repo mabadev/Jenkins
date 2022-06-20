@@ -1,0 +1,203 @@
+def jobNameParts = JOB_NAME.tokenize('/') as String[]
+def jobName = jobNameParts[0].replace("HAI-","")
+def client_name = jobName.substring(0, 1).toUpperCase() + jobName.substring(1)
+
+pipeline {
+
+  agent any
+
+  environment {
+    hai_version = 'null'
+    hai_version_repo = 'null'
+    devServerName = 'htesd-htecnct01'
+    qualSeverName = 'htesq-htecnct02'
+    client_version = 'null'
+    //client_name = name
+    build_release = 'false'
+  }
+
+  parameters {
+      booleanParam(name: "test", defaultValue: true, description: "Whether to run tests or not")
+      booleanParam(name: "pack_setups", defaultValue: false, description: "Whether to pack the setups or not")
+      booleanParam(name: "pack_setups_gui", defaultValue: false, description: "Whether to pack the gui setups or not")
+      choice(name: "versionIncrement", choices: ['minor','major','patch'], description: "Select: minor(0.*.0), major(*.0.0) or patch(0.0.*)")
+      string(name: "client_version_string", defaultValue: "default", description: "Version for the parsers package (e.g. 0.6.1). This will overwrite version increment if not default! It must not empty")
+      booleanParam(name: "deploy_dev", defaultValue: false, description: "Whether to deploy the built release to the dev server")
+      booleanParam(name: "deploy_gui_dev", defaultValue: false, description: "Whether to deploy the built gui release to the dev server")
+      booleanParam(name: "deploy_qa", defaultValue: false, description: "Whether to deploy the built release to the qa server")
+      booleanParam(name: "deploy_gui_qa", defaultValue: false, description: "Whether to deploy the built gui release to the qa server")
+      booleanParam(name: "publish", defaultValue: false, description: "Whether publish the release file")
+  }
+
+  stages {
+    stage('Build') {
+      post {
+        always {
+          // discoverGitReferenceBuild
+          //INFO: https://github.com/jenkinsci/warnings-ng-plugin/blob/master/doc/Documentation.md#quality-gate-configuration
+          //recordIssues enabledForFailure: true, aggregatingResults: true, tools:[msBuild()], qualityGates: [[threshold: 1, type: 'NEW', unstable: false]]
+          recordIssues enabledForFailure: true, aggregatingResults: true, tools:[msBuild()], qualityGates: [[threshold: 999, type: 'TOTAL', unstable: false]]
+        }
+      }
+      steps {
+        echo "${client_name}"
+        withCredentials([gitUsernamePassword(credentialsId: 'jenkins', gitToolName: 'git-tool')]) {
+            bat 'git submodule update --init --recursive'
+        }
+        bat 'dotnet clean'
+        bat 'dotnet build --configuration Release'
+      }
+    }
+
+    stage('Get version') {
+      steps {
+        script {
+          echo 'Parameter version_string not specified - calculating version from git history.'
+          hai_version_repo = bat (
+            script: '@git -C .\\src\\Hai.Framework describe --tags',
+            returnStdout: true
+          ).trim()
+          echo 'hai version repo: ' + hai_version_repo
+          //remove the 'v' from the version string
+          hai_version = hai_version_repo.getAt(1..hai_version_repo.length() - 1)
+
+          if (params.client_version_string == 'default') {
+            echo 'Parameter client_version_string not specified - calculating version from git history.'
+              withCredentials([gitUsernamePassword(credentialsId: 'jenkins', gitToolName: 'git-tool')]) {
+              bat 'git fetch --depth=500' // Do not delete this line. This is imported to run the next line
+              // See her: https://stackoverflow.com/questions/6802145/how-to-convert-a-git-shallow-clone-to-a-full-clone
+
+              if(env.BRANCH_NAME == 'qual' || env.BRANCH_NAME == 'production')
+                client_version = bat (returnStdout: true, script: '@git describe --tags --abbrev=0').trim().substring(1)
+              else
+                client_version = bat (returnStdout: true, script: '@git describe --tags').trim().substring(1)
+            }
+          } else {
+            echo 'Parameter client_version_string specified - using this as version.'
+            client_version = params.client_version_string;
+          }
+          echo 'client version is : ' + client_version
+        }
+      }
+    }
+
+    stage('Versioning') {
+      when {
+        anyOf { branch 'qual'; branch 'production'}
+      }
+      steps {
+        script {
+          echo 'Versioning started'
+          if(params.client_version_string == 'default'){
+            def scope = params.versionIncrement
+            def version = client_version.split('\\.')
+            echo 'version: ' + version
+            def major = version[0].toInteger()
+            def minor = version[1].toInteger()
+            def patch = version[2].toInteger()
+            def nextVersion
+            switch (scope) {
+              case 'major':
+                nextVersion = "${major + 1}.0.0"
+                echo 'nextVersion : major'
+                break
+              case 'minor':
+                nextVersion = "${major}.${minor + 1}.0"
+                echo 'nextVersion : minor'
+                break
+              case 'patch':
+                nextVersion = "${major}.${minor}.${patch + 1}"
+                echo 'nextVersion : patch'
+                break
+              }
+            client_version = nextVersion
+          }
+          echo 'client version is : ' + client_version
+          build_release = 'true'
+        }
+      }
+    }
+
+    stage('Test') {
+      post {
+        always {
+          xunit(thresholds: [ skipped(failureThreshold: '5'), failed(failureThreshold: '0') ], tools: [[$class: 'XUnitDotNetTestType', pattern: "**/test_result.xml"]])
+        }
+      }
+      when { expression { params.test } }
+      steps {
+        bat 'dotnet test --no-build --configuration Release --filter "FullyQualifiedName!~IntegrationTests&FullyQualifiedName!~Templates" --logger:"xunit;LogFilePath=test_result.xml"'
+      }
+    }
+
+    stage('Pack') {
+        when { expression { params.pack_setups || build_release == 'true' } }
+        steps {
+          script {
+            powershell ".\\src\\Hai.Framework\\tools\\publish.ps1 -version ${hai_version} -clientVersion ${client_version}"
+            archiveArtifacts artifacts: "src/Hai.Framework/Archives/*.zip", fingerprint: true
+          }
+        }
+      }
+
+    stage('Deploy DEV') {
+      when { expression { params.pack_setups && params.deploy_dev } }
+      steps {
+        powershell ".\\src\\Hai.Framework\\tools\\deploy.ps1 -destinationServerName ${devServerName} -destinationServiceName 'hai.application' -destinationFilePath '\\\\${devServerName}\\c\$\\hteConnectAnInstruments'"
+      }
+    }
+
+    stage('Deploy QA') {
+      when { expression { params.pack_setups && params.deploy_qa } }
+      steps {
+        powershell ".\\src\\Hai.Framework\\tools\\deploy.ps1 -destinationServerName ${qualSeverName} -destinationServiceName 'hai.application' -destinationFilePath '\\\\${qualSeverName}\\c\$\\hteConnectAnInstruments'"
+      }
+    }
+
+    stage('Pack GUI') {
+        when { expression { params.pack_setups_gui } }
+        steps {
+          script {
+            powershell ".\\src\\Hai.Framework\\tools\\publish-gui.ps1 -version ${hai_version}"
+            archiveArtifacts artifacts: "src/Hai.Framework/Archives/*.zip", fingerprint: true
+          }
+        }
+      }
+
+    stage('Deploy GUI DEV') {
+      when { expression { params.pack_setups_gui && params.deploy_gui_dev } }
+      steps {
+        powershell ".\\src\\Hai.Framework\\tools\\deploy-gui.ps1 -destinationServerName ${devServerName} -destinationServiceName 'hai.GUI' -destinationFilePath '\\\\${devServerName}\\c\$\\hteConnectAnInstruments\\hteConnect.AnInstruments.GUI'"
+      }
+    }
+
+    stage('Deploy GUI QA') {
+      when { expression { params.pack_setups_gui && params.deploy_gui_qa } }
+      steps {
+        powershell ".\\src\\Hai.Framework\\tools\\deploy-gui.ps1 -destinationServerName ${qualSeverName} -destinationServiceName 'hai.GUI' -destinationFilePath '\\\\${qualSeverName}\\c\$\\hteConnectAnInstruments\\hteConnect.AnInstruments.GUI'"
+      }
+    }
+
+    stage('Publish') {
+      when {
+        allOf {
+          anyOf { branch 'qual'; branch 'production' }
+          expression { (params.pack_setups && params.publish) || build_release == 'true'}
+        }
+      }
+      steps {
+        withCredentials([gitUsernamePassword(credentialsId: 'jenkins', gitToolName: 'git-tool')]) {
+          bat "git tag -a v${client_version} -m 'jenkins'"
+          bat "git push origin --tags"
+        }
+        powershell ".\\src\\Hai.Framework\\tools\\copy-file-to-folder.ps1 -sourceRelativeFilePath '..\\Archives\\hteConnect.AnInstruments.release.${hai_version}.${client_name}.${client_version}.zip' -destinationFolderPath '${env.HAI_RELEASEFOLDER}'"
+      }
+    }
+  }
+
+  post {
+    always {
+        cleanWs()
+    }
+  }
+}
